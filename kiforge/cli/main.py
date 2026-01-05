@@ -30,10 +30,12 @@ def footprint(
     pitch: float = typer.Option(..., "--pitch", help="Pin pitch in mm"),
     body: str = typer.Option(..., "--body", "-b", help="Body size WxH in mm (e.g., 7x7)"),
     output: Path = typer.Option(Path("."), "--output", "-o", help="Output directory"),
-    lead_span: float | None = typer.Option(None, "--lead-span", help="Lead span in mm (default: body + 2mm)"),
+    lead_span: float | None = typer.Option(None, "--lead-span", help="Lead span in mm (QFP only, default: body + 2mm)"),
+    thermal_pad: float | None = typer.Option(None, "--thermal-pad", "-t", help="Thermal pad size in mm (QFN only)"),
 ) -> None:
     """Generate a parametric footprint."""
     from kiforge.core.footprint.qfp import create_qfp_footprint
+    from kiforge.core.footprint.qfn import create_qfn_footprint
 
     # Parse body dimensions
     try:
@@ -48,19 +50,20 @@ def footprint(
         console.print("Expected format: WxH (e.g., 7x7 or 10x10)")
         raise typer.Exit(1)
 
-    # Calculate lead span if not specified
-    if lead_span is None:
-        lead_span = max(body_w, body_h) + 2.0  # Add 2mm for leads
-
     package_upper = package.upper()
 
     console.print(f"Generating [cyan]{package_upper}-{pins}[/cyan] footprint:")
     console.print(f"  Pitch: {pitch}mm")
     console.print(f"  Body: {body_w}x{body_h}mm")
-    console.print(f"  Lead span: {lead_span}mm")
 
     # Generate based on package type
     if package_upper in ("QFP", "LQFP", "TQFP", "VQFP"):
+        # Calculate lead span if not specified
+        if lead_span is None:
+            lead_span = max(body_w, body_h) + 2.0  # Add 2mm for leads
+
+        console.print(f"  Lead span: {lead_span}mm")
+
         try:
             content = create_qfp_footprint(
                 pins=pins,
@@ -80,9 +83,35 @@ def footprint(
         output_path.write_text(content)
 
         console.print(f"[green]Created:[/green] {output_path}")
+
+    elif package_upper in ("QFN", "DFN", "VQFN", "WQFN"):
+        if thermal_pad is not None:
+            console.print(f"  Thermal pad: {thermal_pad}x{thermal_pad}mm")
+
+        try:
+            content = create_qfn_footprint(
+                pins=pins,
+                pitch=pitch,
+                body_width=body_w,
+                body_length=body_h,
+                thermal_pad_size=thermal_pad,
+                variant=package_upper,
+            )
+        except ValueError as e:
+            console.print(f"[red]Error: {e}[/red]")
+            raise typer.Exit(1)
+
+        # Write output
+        ep_str = f"_EP{thermal_pad}x{thermal_pad}mm" if thermal_pad else ""
+        output_path = output / f"{package_upper}-{pins}_{body_w}x{body_h}mm_P{pitch}mm{ep_str}.kicad_mod"
+        output.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(content)
+
+        console.print(f"[green]Created:[/green] {output_path}")
+
     else:
         console.print(f"[yellow]Package type {package_upper} not yet implemented[/yellow]")
-        console.print("Supported packages: QFP, LQFP, TQFP, VQFP")
+        console.print("Supported packages: QFP, LQFP, TQFP, VQFP, QFN, DFN, VQFN, WQFN")
         raise typer.Exit(1)
 
 
@@ -220,6 +249,23 @@ def generate(
             console.print(f"  [green]Created:[/green] {footprint_path}")
         except ValueError as e:
             console.print(f"  [yellow]Skipped footprint: {e}[/yellow]")
+    elif pkg_type in ("QFN", "DFN", "VQFN", "WQFN"):
+        from kiforge.core.footprint.qfn import create_qfn_footprint
+
+        console.print("Generating footprint...")
+        try:
+            footprint_content = create_qfn_footprint(
+                pins=pins,
+                pitch=pitch,
+                body_width=body_w,
+                body_length=body_h,
+                variant=pkg_type,
+            )
+            footprint_path = output / f"{pkg_type}-{pins}_{body_w}x{body_h}mm_P{pitch}mm.kicad_mod"
+            footprint_path.write_text(footprint_content)
+            console.print(f"  [green]Created:[/green] {footprint_path}")
+        except ValueError as e:
+            console.print(f"  [yellow]Skipped footprint: {e}[/yellow]")
     else:
         console.print(f"  [yellow]Footprint for {pkg_type} not yet implemented[/yellow]")
 
@@ -275,7 +321,7 @@ def info() -> None:
     console.print("[cyan]Supported Package Types:[/cyan]")
     console.print("  Footprint generation:")
     console.print("    - QFP, LQFP, TQFP, VQFP (Quad Flat Package)")
-    console.print("    - [dim]QFN, DFN (coming soon)[/dim]")
+    console.print("    - QFN, DFN, VQFN, WQFN (Quad Flat No-lead)")
     console.print("    - [dim]BGA, FBGA, WLCSP (coming soon)[/dim]")
     console.print("")
 
