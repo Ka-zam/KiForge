@@ -70,6 +70,17 @@ class PinGroupCategory(str, Enum):
     NC = "nc"  # Not connected
     OTHER = "other"
 
+    # FPGA-specific categories
+    IO_BANK = "io_bank"  # General I/O bank pins
+    CONFIG = "config"  # Configuration pins (DONE, PROGRAMN, INITN, etc.)
+    JTAG = "jtag"  # JTAG interface (TCK, TDI, TDO, TMS)
+    SERDES = "serdes"  # High-speed serializer/deserializer
+    DPHY = "dphy"  # MIPI D-PHY interface
+    ADC = "adc"  # On-chip ADC
+    PLL = "pll"  # PLL-related pins
+    DIFF_P = "diff_p"  # Differential pair positive
+    DIFF_N = "diff_n"  # Differential pair negative
+
 
 class PackageType(str, Enum):
     """Supported IC package families."""

@@ -33,12 +33,14 @@ class SymbolLayout:
     """Layout information for a symbol unit."""
 
     unit: int = 1
+    name: str = ""  # Unit name (e.g., "Bank 0", "JTAG")
     width: float = 10.16  # Default 400 mils
     height: float = 10.16
     left_pins: list[SymbolPin] = field(default_factory=list)
     right_pins: list[SymbolPin] = field(default_factory=list)
     top_pins: list[SymbolPin] = field(default_factory=list)
     bottom_pins: list[SymbolPin] = field(default_factory=list)
+    is_power_unit: bool = False  # If True, unit contains only power/ground pins
 
 
 class SymbolGenerator:
@@ -60,12 +62,32 @@ class SymbolGenerator:
     def layout_pins(self) -> None:
         """Calculate pin positions for the symbol.
 
-        Organizes pins by type:
+        For single-unit symbols, organizes pins by type:
         - Power (VCC, VDD) on top
         - Ground (GND, VSS) on bottom
         - Inputs on left
         - Outputs on right
         - Bidirectional distributed
+
+        For multi-unit symbols, creates separate layouts per unit.
+        """
+        # Check if this is a multi-unit symbol
+        units = set(pin.unit for pin in self.component.pins)
+
+        if len(units) <= 1:
+            # Single unit - use simple layout
+            self._layout_single_unit(self.component.pins, unit=1)
+        else:
+            # Multi-unit - layout each unit separately
+            self._layout_multi_unit(units)
+
+    def _layout_single_unit(self, pins: list[Pin], unit: int = 1, unit_name: str = "") -> None:
+        """Layout pins for a single unit.
+
+        Args:
+            pins: Pins to layout
+            unit: Unit number
+            unit_name: Optional unit name for labeling
         """
         # Group pins by category
         power_pins = []
@@ -76,7 +98,7 @@ class SymbolGenerator:
         nc_pins = []
         other_pins = []
 
-        for pin in self.component.pins:
+        for pin in pins:
             if pin.is_ground:
                 ground_pins.append(pin)
             elif pin.is_supply:
@@ -118,7 +140,16 @@ class SymbolGenerator:
         height = round(height / PIN_SPACING) * PIN_SPACING
         width = round(width / PIN_SPACING) * PIN_SPACING
 
-        layout = SymbolLayout(unit=1, width=width, height=height)
+        # Check if this is a power-only unit
+        is_power = len(power_pins) + len(ground_pins) == len(pins) and len(pins) > 0
+
+        layout = SymbolLayout(
+            unit=unit,
+            name=unit_name,
+            width=width,
+            height=height,
+            is_power_unit=is_power,
+        )
 
         # Position left pins (connection on left, pointing into symbol from left)
         y_start = (len(left_side) - 1) * PIN_SPACING / 2
@@ -152,7 +183,177 @@ class SymbolGenerator:
                 SymbolPin(pin=pin, x=x, y=-height / 2 - PIN_LENGTH, orientation=PinOrientation.UP)
             )
 
-        self.layouts = [layout]
+        self.layouts.append(layout)
+
+    def _layout_multi_unit(self, units: set[int]) -> None:
+        """Layout pins for a multi-unit symbol.
+
+        Args:
+            units: Set of unit numbers present in the component
+        """
+        # Try to import unit names from FPGA parser if available
+        try:
+            from kiforge.core.parser.fpga_csv_parser import get_fpga_unit_names
+            unit_names = get_fpga_unit_names()
+        except ImportError:
+            unit_names = {}
+
+        # Sort units for consistent ordering
+        sorted_units = sorted(units)
+
+        # Layout each unit
+        for unit_num in sorted_units:
+            unit_pins = [p for p in self.component.pins if p.unit == unit_num]
+            if not unit_pins:
+                continue
+
+            unit_name = unit_names.get(unit_num, f"Unit {unit_num}")
+            self._layout_unit_pins(unit_pins, unit_num, unit_name)
+
+    def _layout_unit_pins(self, pins: list[Pin], unit: int, unit_name: str = "") -> None:
+        """Layout pins for a specific unit with FPGA-aware organization.
+
+        For I/O bank units, groups differential pairs together.
+        For power units, stacks power on top and ground on bottom.
+
+        Args:
+            pins: Pins for this unit
+            unit: Unit number
+            unit_name: Human-readable unit name
+        """
+        # Separate power/ground from signal pins
+        power_pins = [p for p in pins if p.is_supply]
+        ground_pins = [p for p in pins if p.is_ground]
+        nc_pins = [p for p in pins if p.is_nc]
+        signal_pins = [p for p in pins if not (p.is_supply or p.is_ground or p.is_nc)]
+
+        # Sort power pins by name
+        power_pins.sort(key=lambda p: p.name)
+        ground_pins.sort(key=lambda p: p.name)
+
+        # For signal pins, try to keep differential pairs together
+        signal_pins = self._sort_with_diff_pairs(signal_pins)
+
+        # Distribute signal pins between left and right sides
+        # Put positive diff pins and inputs on left, negative and outputs on right
+        left_signals = []
+        right_signals = []
+
+        for pin in signal_pins:
+            name = pin.name.upper()
+            # Positive differential or input-like
+            if name.endswith("P") or name.endswith("A") or pin.electrical_type == PinElectricalType.INPUT:
+                left_signals.append(pin)
+            # Negative differential or output-like
+            elif name.endswith("N") or name.endswith("B") or pin.electrical_type == PinElectricalType.OUTPUT:
+                right_signals.append(pin)
+            else:
+                # Distribute evenly
+                if len(left_signals) <= len(right_signals):
+                    left_signals.append(pin)
+                else:
+                    right_signals.append(pin)
+
+        # Calculate dimensions
+        max_side = max(len(left_signals), len(right_signals), 1)
+        max_tb = max(len(power_pins), len(ground_pins) + len(nc_pins), 1)
+
+        height = max(max_side * PIN_SPACING + 2 * PIN_SPACING, 10.16)
+        width = max(max_tb * PIN_SPACING + 4 * PIN_SPACING, 10.16)
+
+        # Round to grid
+        height = round(height / PIN_SPACING) * PIN_SPACING
+        width = round(width / PIN_SPACING) * PIN_SPACING
+
+        # Check if power-only unit
+        is_power = len(signal_pins) == 0 and (len(power_pins) > 0 or len(ground_pins) > 0)
+
+        layout = SymbolLayout(
+            unit=unit,
+            name=unit_name,
+            width=width,
+            height=height,
+            is_power_unit=is_power,
+        )
+
+        # Position pins
+        # Left side
+        y_start = (len(left_signals) - 1) * PIN_SPACING / 2
+        for i, pin in enumerate(left_signals):
+            y = y_start - i * PIN_SPACING
+            layout.left_pins.append(
+                SymbolPin(pin=pin, x=-width / 2 - PIN_LENGTH, y=y, orientation=PinOrientation.RIGHT)
+            )
+
+        # Right side
+        y_start = (len(right_signals) - 1) * PIN_SPACING / 2
+        for i, pin in enumerate(right_signals):
+            y = y_start - i * PIN_SPACING
+            layout.right_pins.append(
+                SymbolPin(pin=pin, x=width / 2 + PIN_LENGTH, y=y, orientation=PinOrientation.LEFT)
+            )
+
+        # Top (power)
+        x_start = -(len(power_pins) - 1) * PIN_SPACING / 2
+        for i, pin in enumerate(power_pins):
+            x = x_start + i * PIN_SPACING
+            layout.top_pins.append(
+                SymbolPin(pin=pin, x=x, y=height / 2 + PIN_LENGTH, orientation=PinOrientation.DOWN)
+            )
+
+        # Bottom (ground + NC)
+        bottom_pins = ground_pins + nc_pins
+        x_start = -(len(bottom_pins) - 1) * PIN_SPACING / 2
+        for i, pin in enumerate(bottom_pins):
+            x = x_start + i * PIN_SPACING
+            layout.bottom_pins.append(
+                SymbolPin(pin=pin, x=x, y=-height / 2 - PIN_LENGTH, orientation=PinOrientation.UP)
+            )
+
+        self.layouts.append(layout)
+
+    def _sort_with_diff_pairs(self, pins: list[Pin]) -> list[Pin]:
+        """Sort pins keeping differential pairs adjacent.
+
+        Pairs are identified by matching names with P/N or A/B suffixes.
+
+        Args:
+            pins: List of pins to sort
+
+        Returns:
+            Sorted list with pairs adjacent
+        """
+        import re
+
+        # Build a map of base names to pins
+        pairs: dict[str, list[Pin]] = {}
+        singles: list[Pin] = []
+
+        for pin in pins:
+            name = pin.name.upper()
+            # Check for differential pair naming
+            match = re.match(r"(.+?)([PN]|[AB])$", name)
+            if match:
+                base = match.group(1)
+                if base not in pairs:
+                    pairs[base] = []
+                pairs[base].append(pin)
+            else:
+                singles.append(pin)
+
+        # Build sorted output: pairs first (P before N), then singles
+        result = []
+        for base in sorted(pairs.keys()):
+            pair_pins = pairs[base]
+            # Sort so P/A comes before N/B
+            pair_pins.sort(key=lambda p: (0 if p.name.upper().endswith(("P", "A")) else 1, p.name))
+            result.extend(pair_pins)
+
+        # Add singles, sorted by name
+        singles.sort(key=lambda p: p.name)
+        result.extend(singles)
+
+        return result
 
     def generate(self) -> str:
         """Generate the complete symbol library file.
@@ -186,6 +387,12 @@ class SymbolGenerator:
         name = self.component.name
 
         lines.append(f'  (symbol "{name}"')
+
+        # Multi-unit symbols need special flags
+        if len(self.layouts) > 1:
+            lines.append("    (pin_numbers hide)")
+            lines.append("    (pin_names (offset 1.016))")
+
         lines.append("    (exclude_from_sim no)")
         lines.append("    (in_bom yes)")
         lines.append("    (on_board yes)")
@@ -193,12 +400,17 @@ class SymbolGenerator:
         # Properties
         lines.append(self._generate_properties())
 
-        # Generate shared graphics (unit 0, style 1)
-        lines.append(self._generate_body_graphics())
-
-        # Generate pins for each unit
-        for layout in self.layouts:
-            lines.append(self._generate_unit_pins(layout))
+        # For multi-unit, each unit has its own body
+        if len(self.layouts) > 1:
+            # Generate per-unit graphics and pins
+            for layout in self.layouts:
+                lines.append(self._generate_unit_body(layout))
+                lines.append(self._generate_unit_pins(layout))
+        else:
+            # Single unit - shared graphics
+            lines.append(self._generate_body_graphics())
+            for layout in self.layouts:
+                lines.append(self._generate_unit_pins(layout))
 
         lines.append("  )")
 
@@ -280,6 +492,41 @@ class SymbolGenerator:
             f"\n        (fill (type background))"
             f"\n      )"
         )
+
+        lines.append("    )")
+
+        return "\n".join(lines)
+
+    def _generate_unit_body(self, layout: SymbolLayout) -> str:
+        """Generate body graphics for a specific unit (multi-unit symbols)."""
+        lines = []
+        name = self.component.name
+
+        # Unit N, Style 0 = unit-specific graphics
+        lines.append(f'    (symbol "{name}_{layout.unit}_0"')
+
+        # Body rectangle
+        x1 = -layout.width / 2
+        y1 = layout.height / 2
+        x2 = layout.width / 2
+        y2 = -layout.height / 2
+
+        lines.append(
+            f"      (rectangle (start {x1:.2f} {y1:.2f}) (end {x2:.2f} {y2:.2f})"
+            f"\n        (stroke (width {LINE_WIDTH}) (type default))"
+            f"\n        (fill (type background))"
+            f"\n      )"
+        )
+
+        # Add unit name label inside the rectangle
+        if layout.name:
+            label_y = y1 - 1.27  # Just below top edge
+            lines.append(
+                f'      (text "{layout.name}"'
+                f"\n        (at 0 {label_y:.2f} 0)"
+                f"\n        (effects (font (size {FONT_SIZE} {FONT_SIZE})))"
+                f"\n      )"
+            )
 
         lines.append("    )")
 
